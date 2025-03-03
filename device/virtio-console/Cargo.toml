@@ -1,0 +1,16 @@
+[package]
+name = "virtio-console"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+virtio = { path = "../../virtio" }
+vm-memory = { version = "0.16.1", features = ["backend-mmap", "backend-atomic"]  }
+virtio-queue = "0.14.0"
+log = "0.4.25"
+nix = { version = "0.29.0", features = ["poll", "fs"] }
+vmm-sys-util ="0.12.1"
+anyhow = "1.0.95"
+polling = "3.7.4"
+event_token_derive = { path = "../../event_token_derive" }
+event_manager = { path = "../../event_manager" }

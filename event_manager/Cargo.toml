@@ -1,0 +1,12 @@
+[package]
+name = "event_manager"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+arbitrary-int = ["dep:arbitrary-int"]
+
+[dependencies]
+vmm-sys-util = "0.12.1"
+event_token_derive = { path = "../event_token_derive" }
+arbitrary-int = { version = "1.3.0", optional = true, default-features = true }
