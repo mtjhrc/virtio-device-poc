@@ -11,25 +11,18 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use libc::c_void;
 use log::{debug, error, trace, warn};
 use rutabaga_gfx::{
     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaComponentType,
     RutabagaFence, RutabagaFenceHandler, RutabagaIntoRawDescriptor, RutabagaIovec, Transfer3D,
 };
-use vhost::vhost_user::{
-    gpu_message::{
-        VhostUserGpuCursorPos, VhostUserGpuCursorUpdate, VhostUserGpuEdidRequest,
-        VhostUserGpuScanout, VhostUserGpuUpdate,
-    },
-    GpuBackend,
-};
-use vhost_user_backend::{VringRwLock, VringT};
-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
+use vhost::vhost_user::gpu_message::{VhostUserGpuCursorPos, VhostUserGpuCursorUpdate, VhostUserGpuEdidRequest, VhostUserGpuScanout, VhostUserGpuUpdate};
+use vhost::vhost_user::GpuBackend;
+use virtio_queue::{QueueT};
+use vm_memory::{GuestAddressSpace, VolatileSlice};
 use vmm_sys_util::eventfd::EventFd;
-
+use virtio::DeviceQueue;
 use crate::{
-    device::Error,
     protocol::{
         virtio_gpu_rect, GpuResponse,
         GpuResponse::{
@@ -41,28 +34,7 @@ use crate::{
     },
     GpuConfig, GpuMode,
 };
-
-fn sglist_to_rutabaga_iovecs(
-    vecs: &[(GuestAddress, usize)],
-    mem: &GuestMemoryMmap,
-) -> Result<Vec<RutabagaIovec>, ()> {
-    if vecs
-        .iter()
-        .any(|&(addr, len)| mem.get_slice(addr, len).is_err())
-    {
-        return Err(());
-    }
-
-    let mut rutabaga_iovecs: Vec<RutabagaIovec> = Vec::new();
-    for &(addr, len) in vecs {
-        let slice = mem.get_slice(addr, len).unwrap();
-        rutabaga_iovecs.push(RutabagaIovec {
-            base: slice.ptr_guard_mut().as_ptr().cast::<c_void>(),
-            len,
-        });
-    }
-    Ok(rutabaga_iovecs)
-}
+use crate::device::Error;
 
 #[derive(Default, Debug)]
 pub struct Rectangle {
@@ -105,8 +77,7 @@ pub trait VirtioGpu {
         ctx_id: u32,
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
-        vecs: Vec<(GuestAddress, usize)>,
-        mem: &GuestMemoryMmap,
+        iovecs: Vec<RutabagaIovec>
     ) -> VirtioGpuResult;
 
     fn process_fence(
@@ -195,8 +166,7 @@ pub trait VirtioGpu {
     fn attach_backing(
         &mut self,
         resource_id: u32,
-        mem: &GuestMemoryMmap,
-        vecs: Vec<(GuestAddress, usize)>,
+        iovecs: Vec<RutabagaIovec>,
     ) -> VirtioGpuResult;
 
     /// Detaches any previously attached iovecs from the resource.
@@ -274,7 +244,7 @@ impl AssociatedScanouts {
         self.0 != 0
     }
 
-    fn iter_enabled(self) -> impl Iterator<Item = u32> {
+    fn iter_enabled(self) -> impl Iterator<Item=u32> {
         (0..VIRTIO_GPU_MAX_SCANOUTS).filter(move |i| ((self.0 >> i) & 1) == 1)
     }
 }
@@ -331,10 +301,15 @@ pub struct RutabagaVirtioGpu {
 const READ_RESOURCE_BYTES_PER_PIXEL: u32 = 4;
 
 impl RutabagaVirtioGpu {
-    fn create_fence_handler(
-        queue_ctl: VringRwLock,
+    fn create_fence_handler<Q, M>(
+        device_queue: Q,
+        mem: M,
         fence_state: Arc<Mutex<FenceState>>,
-    ) -> RutabagaFenceHandler {
+    ) -> RutabagaFenceHandler
+    where
+        Q: DeviceQueue + Send + Sync + 'static,
+        M: GuestAddressSpace + Send + Sync + 'static,
+    {
         RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
             debug!(
                 "XXX - fence called: id={}, ring_idx={}",
@@ -352,6 +327,7 @@ impl RutabagaVirtioGpu {
                 },
             };
 
+            let mem = mem.memory();
             while i < fence_state.descs.len() {
                 debug!("XXX - fence_id: {}", fence_state.descs[i].fence_id);
                 if fence_state.descs[i].ring == ring
@@ -363,11 +339,16 @@ impl RutabagaVirtioGpu {
                         completed_desc.desc_index
                     );
 
-                    queue_ctl
-                        .add_used(completed_desc.desc_index, completed_desc.len)
+                    let Some(mut queue) = device_queue.try_lock_queue() else {
+                        warn!("FIXME: the queue should be available at this point!");
+                        continue;
+                    };
+
+                    queue
+                        .add_used(&*mem, completed_desc.desc_index, completed_desc.len)
                         .unwrap();
 
-                    queue_ctl
+                    device_queue
                         .signal_used_queue()
                         .map_err(Error::NotificationFailed)
                         .unwrap();
@@ -400,9 +381,13 @@ impl RutabagaVirtioGpu {
             .set_use_external_blob(true)
     }
 
-    pub fn new(queue_ctl: &VringRwLock, gpu_config: &GpuConfig, gpu_backend: GpuBackend) -> Self {
+    pub fn new<Q, M>(queue_ctl: Q, mem: M, gpu_config: &GpuConfig, gpu_backend: GpuBackend) -> Self
+    where
+        Q: DeviceQueue + Send + Sync + 'static,
+        M: GuestAddressSpace + Send + Sync + 'static,
+    {
         let fence_state = Arc::new(Mutex::new(FenceState::default()));
-        let fence = Self::create_fence_handler(queue_ctl.clone(), fence_state.clone());
+        let fence = Self::create_fence_handler(queue_ctl, mem, fence_state.clone());
         let rutabaga = Self::configure_rutabaga_builder(gpu_config)
             .build(fence, None)
             .expect("Rutabaga initialization failed!");
@@ -695,11 +680,9 @@ impl VirtioGpu for RutabagaVirtioGpu {
     fn attach_backing(
         &mut self,
         resource_id: u32,
-        mem: &GuestMemoryMmap,
-        vecs: Vec<(GuestAddress, usize)>,
+        iovecs: Vec<RutabagaIovec>,
     ) -> VirtioGpuResult {
-        let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|()| ErrUnspec)?;
-        self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        self.rutabaga.attach_backing(resource_id, iovecs)?;
         Ok(OkNoData)
     }
 
@@ -861,8 +844,7 @@ impl VirtioGpu for RutabagaVirtioGpu {
         _ctx_id: u32,
         _resource_id: u32,
         _resource_create_blob: ResourceCreateBlob,
-        _vecs: Vec<(GuestAddress, usize)>,
-        _mem: &GuestMemoryMmap,
+        _iovecs: Vec<RutabagaIovec>
     ) -> VirtioGpuResult {
         error!("Not implemented: resource_create_blob");
         Err(ErrUnspec)
@@ -945,7 +927,7 @@ mod tests {
             Some(GpuCapset::VIRGL | GpuCapset::VIRGL2),
             GpuFlags::default(),
         )
-        .unwrap();
+            .unwrap();
         let builder = RutabagaVirtioGpu::configure_rutabaga_builder(&config);
         let rutabaga = builder.build(RutabagaHandler::new(|_| {}), None).unwrap();
         RutabagaVirtioGpu {

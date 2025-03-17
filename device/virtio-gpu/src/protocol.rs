@@ -61,15 +61,13 @@ pub use virtio_bindings::virtio_gpu::{
 };
 use virtio_queue::{Reader, Writer};
 use vm_memory::{ByteValued, GuestAddress, Le32, Le64};
-
+use vm_memory::bitmap::BitmapSlice;
 use crate::device::{self, Error};
 
 pub const QUEUE_SIZE: usize = 1024;
-pub const NUM_QUEUES: usize = 2;
 
-pub const CONTROL_QUEUE: u16 = 0;
-pub const CURSOR_QUEUE: u16 = 1;
-pub const POLL_EVENT: u16 = 3;
+pub const CONTROL_QUEUE: usize = 0;
+pub const CURSOR_QUEUE: usize = 1;
 
 pub const VIRTIO_GPU_MAX_SCANOUTS: u32 = 16;
 
@@ -109,7 +107,7 @@ impl std::fmt::Display for InvalidCommandType {
     }
 }
 
-impl From<InvalidCommandType> for crate::device::Error {
+impl From<InvalidCommandType> for device::Error {
     fn from(val: InvalidCommandType) -> Self {
         Self::InvalidCommandType(val.0)
     }
@@ -760,8 +758,8 @@ impl GpuCommand {
     }
 
     /// Decodes a command from the given chunk of memory.
-    pub fn decode(
-        reader: &mut Reader,
+    pub fn decode<B: BitmapSlice>(
+        reader: &mut Reader<B>,
     ) -> Result<(virtio_gpu_ctrl_hdr, Self), GpuCommandDecodeError> {
         use self::GpuCommand::*;
         let hdr = reader
@@ -977,13 +975,13 @@ pub type VirtioGpuResult = std::result::Result<GpuResponse, GpuResponse>;
 
 impl GpuResponse {
     /// Encodes a this `GpuResponse` into `resp` and the given set of metadata.
-    pub fn encode(
+    pub fn encode<B: BitmapSlice>(
         &self,
         flags: u32,
         fence_id: u64,
         ctx_id: u32,
         ring_idx: u8,
-        writer: &mut Writer,
+        writer: &mut Writer<B>,
     ) -> Result<u32, GpuResponseEncodeError> {
         let hdr = virtio_gpu_ctrl_hdr {
             type_: self.get_type().into(),

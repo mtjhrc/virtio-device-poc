@@ -35,26 +35,17 @@
     clippy::significant_drop_tightening
 )]
 
-pub mod device;
-pub mod protocol;
-pub mod virtio_gpu;
-
-use std::{
-    fmt::{Display, Formatter},
-    path::Path,
-};
-
-use bitflags::bitflags;
 use clap::ValueEnum;
+use derive_more::{AsMut, AsRef};
 use log::info;
-#[cfg(feature = "gfxstream")]
-use rutabaga_gfx::{RUTABAGA_CAPSET_GFXSTREAM_GLES, RUTABAGA_CAPSET_GFXSTREAM_VULKAN};
-use rutabaga_gfx::{RUTABAGA_CAPSET_VIRGL, RUTABAGA_CAPSET_VIRGL2};
+use std::fmt::{Display, Formatter};
+use std::path::Path;
 use thiserror::Error as ThisError;
-use vhost_user_backend::VhostUserDaemon;
+use vhost::vhost_user::{GpuBackend, VhostUserProtocolFeatures};
 use vm_memory::{GuestMemoryAtomic, GuestMemoryMmap};
-
-use crate::device::VhostUserGpuBackend;
+use vhost_user::{VhostUserDaemon, VhostUserDeviceImplementer};
+use virtio_gpu::device::GpuDevice;
+use virtio_gpu::{device, GpuConfig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum GpuMode {
@@ -62,6 +53,20 @@ pub enum GpuMode {
     VirglRenderer,
     #[cfg(feature = "gfxstream")]
     Gfxstream,
+}
+
+impl Into<virtio_gpu::GpuMode> for GpuMode {
+    fn into(self) -> virtio_gpu::GpuMode {
+        match self {
+            Self::VirglRenderer => {
+                virtio_gpu::GpuMode::VirglRenderer
+            }
+            #[cfg(feature = "gfxstream")]
+            GpuMode::Gfxstream => {
+                virtio_gpu::GpuMode::Gfxstream
+            }
+        }
+    }
 }
 
 impl Display for GpuMode {
@@ -74,182 +79,46 @@ impl Display for GpuMode {
     }
 }
 
-bitflags! {
-    /// A bitmask for representing supported gpu capability sets.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct GpuCapset: u64 {
-        const VIRGL = 1 << RUTABAGA_CAPSET_VIRGL as u64;
-        const VIRGL2 = 1 << RUTABAGA_CAPSET_VIRGL2 as u64;
-        const ALL_VIRGLRENDERER_CAPSETS = Self::VIRGL.bits() | Self::VIRGL2.bits();
-
-        #[cfg(feature = "gfxstream")]
-        const GFXSTREAM_VULKAN = 1 << RUTABAGA_CAPSET_GFXSTREAM_VULKAN as u64;
-        #[cfg(feature = "gfxstream")]
-        const GFXSTREAM_GLES = 1 << RUTABAGA_CAPSET_GFXSTREAM_GLES as u64;
-        #[cfg(feature = "gfxstream")]
-        const ALL_GFXSTREAM_CAPSETS = Self::GFXSTREAM_VULKAN.bits() | Self::GFXSTREAM_GLES.bits();
-    }
-}
-
-impl Display for GpuCapset {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut first = true;
-        for capset in self.iter() {
-            if !first {
-                write!(f, ", ")?;
-            }
-            first = false;
-
-            match capset {
-                Self::VIRGL => write!(f, "virgl"),
-                Self::VIRGL2 => write!(f, "virgl2"),
-                #[cfg(feature = "gfxstream")]
-                Self::GFXSTREAM_VULKAN => write!(f, "gfxstream-vulkan"),
-                #[cfg(feature = "gfxstream")]
-                Self::GFXSTREAM_GLES => write!(f, "gfxstream-gles"),
-                _ => panic!("Unknown capset {:#x}", self.bits()),
-            }?;
-        }
-
-        Ok(())
-    }
-}
-
-impl GpuCapset {
-    /// Return the number of enabled capsets
-    pub const fn num_capsets(self) -> u32 {
-        self.bits().count_ones()
-    }
-}
-
-#[derive(Debug, Clone)]
-/// This structure holds the configuration for the GPU backend
-pub struct GpuConfig {
-    gpu_mode: GpuMode,
-    capset: GpuCapset,
-    flags: GpuFlags,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GpuFlags {
-    pub use_egl: bool,
-    pub use_glx: bool,
-    pub use_gles: bool,
-    pub use_surfaceless: bool,
-}
-
-impl GpuFlags {
-    // `const` version of `default()`
-    pub const fn new_default() -> Self {
-        Self {
-            use_egl: true,
-            use_glx: false,
-            use_gles: true,
-            use_surfaceless: true,
-        }
-    }
-}
-
-impl Default for GpuFlags {
-    fn default() -> Self {
-        Self::new_default()
-    }
-}
-
-#[derive(Debug, ThisError)]
-pub enum GpuConfigError {
-    #[error("The mode {0} does not support {1} capset")]
-    CapsetUnsuportedByMode(GpuMode, GpuCapset),
-    #[error("Requested gfxstream-gles capset, but gles is disabled")]
-    GlesRequiredByGfxstream,
-}
-
-impl GpuConfig {
-    pub const DEFAULT_VIRGLRENDER_CAPSET_MASK: GpuCapset = GpuCapset::ALL_VIRGLRENDERER_CAPSETS;
-
-    #[cfg(feature = "gfxstream")]
-    pub const DEFAULT_GFXSTREAM_CAPSET_MASK: GpuCapset = GpuCapset::ALL_GFXSTREAM_CAPSETS;
-
-    pub const fn get_default_capset_for_mode(gpu_mode: GpuMode) -> GpuCapset {
-        match gpu_mode {
-            GpuMode::VirglRenderer => Self::DEFAULT_VIRGLRENDER_CAPSET_MASK,
-            #[cfg(feature = "gfxstream")]
-            GpuMode::Gfxstream => Self::DEFAULT_GFXSTREAM_CAPSET_MASK,
-        }
-    }
-
-    fn validate_capset(gpu_mode: GpuMode, capset: GpuCapset) -> Result<(), GpuConfigError> {
-        let supported_capset_mask = match gpu_mode {
-            GpuMode::VirglRenderer => GpuCapset::ALL_VIRGLRENDERER_CAPSETS,
-            #[cfg(feature = "gfxstream")]
-            GpuMode::Gfxstream => GpuCapset::ALL_GFXSTREAM_CAPSETS,
-        };
-        for capset in capset.iter() {
-            if !supported_capset_mask.contains(capset) {
-                return Err(GpuConfigError::CapsetUnsuportedByMode(gpu_mode, capset));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Create a new instance of the `GpuConfig` struct, containing the
-    /// parameters to be fed into the gpu-backend server.
-    pub fn new(
-        gpu_mode: GpuMode,
-        capset: Option<GpuCapset>,
-        flags: GpuFlags,
-    ) -> Result<Self, GpuConfigError> {
-        let capset = capset.unwrap_or_else(|| Self::get_default_capset_for_mode(gpu_mode));
-        Self::validate_capset(gpu_mode, capset)?;
-
-        #[cfg(feature = "gfxstream")]
-        if capset.contains(GpuCapset::GFXSTREAM_GLES) && !flags.use_gles {
-            return Err(GpuConfigError::GlesRequiredByGfxstream);
-        }
-
-        Ok(Self {
-            gpu_mode,
-            capset,
-            flags,
-        })
-    }
-
-    pub const fn gpu_mode(&self) -> GpuMode {
-        self.gpu_mode
-    }
-
-    pub const fn capsets(&self) -> GpuCapset {
-        self.capset
-    }
-
-    pub const fn flags(&self) -> &GpuFlags {
-        &self.flags
-    }
-}
-
 #[derive(Debug, ThisError)]
 pub enum StartError {
     #[error("Could not create backend: {0}")]
     CouldNotCreateBackend(device::Error),
     #[error("Could not create daemon: {0}")]
-    CouldNotCreateDaemon(vhost_user_backend::Error),
+    CouldNotCreateDaemon(vhost_user::Error),
     #[error("Fatal error: {0}")]
-    ServeFailed(vhost_user_backend::Error),
+    ServeFailed(vhost_user::Error),
+}
+
+#[derive(AsRef, AsMut)]
+struct VhostUserGpuBackend(GpuDevice);
+
+impl VhostUserDeviceImplementer for VhostUserGpuBackend {
+    type Device = GpuDevice;
+    type Bitmap = ();
+
+    fn protocol_features(&self) -> VhostUserProtocolFeatures {
+        VhostUserProtocolFeatures::MQ
+            | VhostUserProtocolFeatures::CONFIG
+            | VhostUserProtocolFeatures::REPLY_ACK
+            | VhostUserProtocolFeatures::BACKEND_SEND_FD
+    }
+
+    fn set_gpu_socket(&mut self, gpu_backend: GpuBackend) {
+        self.as_mut().set_gpu_socket(gpu_backend);
+    }
 }
 
 pub fn start_backend(socket_path: &Path, config: GpuConfig) -> Result<(), StartError> {
     info!("Starting backend");
-    let backend = VhostUserGpuBackend::new(config).map_err(StartError::CouldNotCreateBackend)?;
+    let device = GpuDevice::new(config).map_err(StartError::CouldNotCreateBackend)?;
+    let backend = VhostUserGpuBackend(device);
 
     let mut daemon = VhostUserDaemon::new(
-        "vhost-device-gpu-backend".to_string(),
-        backend.clone(),
+        "vhost-gpu-backend".to_string(),
+        backend,
         GuestMemoryAtomic::new(GuestMemoryMmap::new()),
     )
-    .map_err(StartError::CouldNotCreateDaemon)?;
-
-    backend.set_epoll_handler(&daemon.get_epoll_handlers());
+        .map_err(StartError::CouldNotCreateDaemon)?;
 
     daemon.serve(socket_path).map_err(StartError::ServeFailed)?;
     Ok(())
@@ -299,7 +168,7 @@ mod tests {
             Some(GpuCapset::VIRGL2),
             GpuFlags::default(),
         )
-        .unwrap();
+            .unwrap();
         assert_eq!(config.gpu_mode(), GpuMode::VirglRenderer);
     }
 

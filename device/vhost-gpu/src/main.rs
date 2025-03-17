@@ -8,7 +8,8 @@ use std::{path::PathBuf, process::exit};
 
 use clap::{ArgAction, Parser, ValueEnum};
 use log::error;
-use vhost_device_gpu::{start_backend, GpuCapset, GpuConfig, GpuConfigError, GpuFlags, GpuMode};
+use vhost_gpu::{start_backend, GpuMode};
+use virtio_gpu::{GpuCapset, GpuConfig, GpuConfigError, GpuFlags};
 
 #[derive(ValueEnum, Debug, Copy, Clone, Eq, PartialEq)]
 #[repr(u64)]
@@ -101,21 +102,23 @@ pub struct GpuFlagsArgs {
     pub use_surfaceless: bool,
 }
 
-impl From<GpuFlagsArgs> for GpuFlags {
-    fn from(args: GpuFlagsArgs) -> Self {
+
+impl Into<GpuFlags> for GpuFlagsArgs {
+    fn into(self) -> GpuFlags {
         GpuFlags {
-            use_egl: args.use_egl,
-            use_glx: args.use_glx,
-            use_gles: args.use_gles,
-            use_surfaceless: args.use_surfaceless,
+            use_egl: self.use_egl,
+            use_glx: self.use_glx,
+            use_gles: self.use_gles,
+            use_surfaceless: self.use_surfaceless,
         }
     }
 }
 
 pub fn config_from_args(args: GpuArgs) -> Result<(PathBuf, GpuConfig), GpuConfigError> {
-    let flags = GpuFlags::from(args.flags);
+    let gpu_mode = args.gpu_mode.into();
     let capset = args.capset.map(capset_names_into_capset);
-    let config = GpuConfig::new(args.gpu_mode, capset, flags)?;
+    let flags = args.flags.into();
+    let config = GpuConfig::new(gpu_mode, capset, flags)?;
     Ok((args.socket_path, config))
 }
 
@@ -137,6 +140,7 @@ pub fn main() {
         exit(1);
     }
 }
+
 
 #[cfg(test)]
 mod tests {

@@ -1,5 +1,5 @@
 [package]
-name = "vhost-device-gpu"
+name = "virtio-gpu"
 version = "0.1.0"
 authors = ["Dorinda Bassey <dbassey@redhat.com>", "Matej Hrica <mhrica@redhat.com>"]
 description = "A virtio-gpu device using the vhost-user protocol."
@@ -15,25 +15,24 @@ resolver = "2"
 
 [features]
 default = ["gfxstream"]
-xen = ["vm-memory/xen", "vhost/xen", "vhost-user-backend/xen"]
 gfxstream = ["rutabaga_gfx/gfxstream"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
-env_logger = "0.11.6"
 libc = "0.2"
 log = "0.4"
-
-[target.'cfg(not(target_env = "musl"))'.dependencies]
+virtio = { path = "../../virtio", features = ["mock"] }
 rutabaga_gfx = { version = "0.1.5", features = ["virgl_renderer"] }
 thiserror = "2.0.11"
-vhost = { version = "0.13.0", features = ["vhost-user-backend"] }
-vhost-user-backend = "0.17"
 virtio-bindings = "0.2.5"
 virtio-queue = "0.14.0"
 vm-memory = "0.16.1"
 vmm-sys-util = "0.12.1"
 bitflags = "2.8.0"
+anyhow = "1.0.95"
+event_manager = { path = "../../event_manager" }
+# TODO: remove this: For now we use it for the GpuBackend struct, for providing display output. That should be
+# abstracted to a trait in the device though
+vhost = { version = "0.13.0", features = ["vhost-user", "vhost-user-backend"] }
 
 [dev-dependencies]
 assert_matches = "1.5"
@@ -42,3 +41,4 @@ rusty-fork = "0.3.0"
 tempfile = "3.17"
 virtio-queue = { version = "0.14", features = ["test-utils"] }
 vm-memory = { version = "0.16.1", features = ["backend-mmap", "backend-atomic"] }
+virtio = { path = "../../virtio", features = ["mock"] }

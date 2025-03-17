@@ -4,4 +4,6 @@ resolver = "2"
 members = [
     "virtio-console",
     "vhost-console",
+    "virtio-gpu",
+    "vhost-gpu"
 ]
