@@ -3,7 +3,7 @@
 ## Synopsis
 
 ```shell
-vhost-device-gpu --socket-path <SOCKET> --gpu-mode <GPU_MODE>
+vhost-gpu --socket-path <SOCKET> --gpu-mode <GPU_MODE>
 ```
 
 ## Description
@@ -110,7 +110,7 @@ First start the daemon on the host machine using either of the 2 gpu modes:
 2) `gfxstream` (if the crate has been compiled with the feature `gfxstream`)
 
 ```shell
-host# vhost-device-gpu --socket-path /tmp/gpu.socket --gpu-mode virglrenderer
+host# vhost-gpu --socket-path /tmp/gpu.socket --gpu-mode virglrenderer
 ```
 
 With QEMU, there are two device front-ends you can use with this device.
